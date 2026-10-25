@@ -1,16 +1,4 @@
-// TraeCode CN Enterprise 协议原生的 Magpie 供应商插件。
-//
-// 按 TRAE 企业版 IDE/CLI 的协议实现，不依赖 traecli 进程，不自动采集网页 cookie：
-//   登录   读取部署 GetLoginGuidance 的 LoginHost，由 Magpie 打开浏览器，回调本机 HTTP
-//          兑换 POST {base}/cloudide/api/v3/trae/oauth/ExchangeToken（code 与 refresh 共用，PascalCase）
-//   续期   ExchangeToken {"RefreshToken","ClientID":"app_EMoamEEZ73f0CkXaXp7hrann"}
-//          → 返回轮换后的 RefreshToken + Token，无任何计费副作用（traecli 的 exec 续期会发模型请求）
-//   用量   POST {base}/cloudide/api/v3/trae/GetUserInfo（头 x-cloudide-token）→ 席位/权益/到期
-//   模型   POST {base}/api/ide/v1/cli/get_config_list {"function":"chat"}
-//          （头 Authorization: Cloud-IDE-JWT + X-App-Id + X-Ide-Version-Code + Originator）
-//   会话   POST {base}/api/ide/v2/llm_raw_chat（头 Cloud-IDE-JWT），SSE 事件流
-// 上述协议来自 2026-10 的 traecli 0.201.1-tob-alpha.1 抓包与接口记录；
-// SSO 完整闭环及成功对话仍需真实部署验收，详见 README。
+// TRAE 企业私有化供应商：浏览器登录、轮换续期、目录和 SSE 对话。
 import { randomUUID } from "node:crypto"
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
@@ -19,13 +7,10 @@ import { dirname, isAbsolute, join, resolve } from "node:path"
 
 const ID = "trae-private"
 
-// traecli ToB raw-chat / get_config_list 的应用 ID（客户端常量，不是某家企业的部署常量）。
+// 协议常量来自 traecli ToB。
 const APP_ID = "7b3f9dc2-8a4e-5c6d-2f1b-9e4a3c5b7df0"
-// ExchangeToken 的 ClientID：traecli 用它把 refresh token 换成 Cloud-IDE-JWT（抓包实证）。
 const EXCHANGE_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-// 浏览器 SSO 的 OAuth client（traecli 登录 URL 里的 client_id）。
 const OAUTH_CLIENT_ID = "ono9krqynydwx5"
-// 授权页优先采用部署 GetLoginGuidance 返回的 LoginHost；环境变量仅作覆盖。
 const SESSION = "x-trae-private-session"
 const UA = "codex_exec/0.201.1-tob-alpha.1 (Mac OS 14.1.2; arm64) dumb (codex_exec; 0.201.1-tob-alpha.1)"
 // 协议版本族（traecli 0.201.1-tob-alpha.1）。
@@ -153,8 +138,7 @@ async function checkLogin(base, token, options = {}) {
   })
 }
 
-// ExchangeToken：token 轮换的唯一入口（抓包实证的请求体）。
-// 注意：每次成功调用都会轮换 RefreshToken，返回的新值必须立即持久化。
+// 续期会轮换 RefreshToken，返回值必须由宿主保存。
 async function exchangeRefreshToken(base, refreshToken, options = {}) {
   const data = await apiPost(sameOriginPath(base, "/cloudide/api/v3/trae/oauth/ExchangeToken"), {
     ...options,
@@ -284,10 +268,7 @@ function iso(ms) {
 }
 
 // ---------------------------------------------------------------------------
-// 网页会话（可选增强）：基础/超额/企业内置模型用量只有控制台会话接口
-// （X-Cloudide-Tob-Session cookie）能读，JWT 调不通（上游 2001）。
-// 会话只用于读用量，绝不用于聊天；来源是旧插件的会话文件自动迁移，
-// 或用户从浏览器 DevTools 复制一次写入 sidecar 文件（无浏览器自动化）。
+// 网页会话仅增强用量明细，缺失时保留 JWT 席位信息。
 // ---------------------------------------------------------------------------
 
 const COOKIE_NAME = "X-Cloudide-Tob-Session"
@@ -728,10 +709,11 @@ function shortError(text) {
   return line.trim().slice(0, 300) || "私有化 TRAE 没有返回可读错误"
 }
 
-function errorResponse(status, message, signIn) {
+function errorResponse(status, message, signIn, code) {
   const headers = { "content-type": "application/json" }
   if (signIn) headers["X-Magpie-Sign-In"] = signIn
-  return new Response(JSON.stringify({ error: { message, type: status === 401 ? "authentication_error" : "server_error" } }), { status, headers })
+  const type = status === 401 ? "authentication_error" : status === 429 ? "insufficient_quota" : "server_error"
+  return new Response(JSON.stringify({ error: { message, type, ...(code ? { code } : {}) } }), { status, headers })
 }
 
 async function* sse(stream, signal) {
@@ -829,7 +811,12 @@ function piece(ev, seenCalls) {
   const event = ev?.event || ""
   if (event === "progress_notice" || QUEUE_EVENTS.has(event)) return {}
   const obj = data && typeof data === "object" ? data : null
-  if (event === "error" || obj?.error) return { error: shortError(obj ? obj.error || obj.message : data) }
+  if (event === "error" || obj?.error) {
+    if (obj?.code === 4222 && String(obj.error).includes("ErrAllModelUserQuotaExceeded")) {
+      return { error: "TRAE 模型额度已用尽", status: 429, code: "ErrAllModelUserQuotaExceeded", signIn: "kept" }
+    }
+    return { error: shortError(obj ? obj.error || obj.message : data) }
+  }
   const security = obj && (obj.hit_rule_name || obj.action_type || obj.execute_point)
   if (event === "content_security" || (security && event !== "output" && event !== "done")) {
     const rule = typeof obj?.hit_rule_name === "string" && obj.hit_rule_name ? `（命中规则 ${obj.hit_rule_name}）` : ""
@@ -881,7 +868,7 @@ function streamResponse(model, first, rest, close = async () => {}) {
         const p = piece(ev, seenCalls)
         if (p.usage) usage = p.usage
         if (p.error) {
-          yield { error: { message: p.error, type: "server_error" } }
+          yield { error: { message: p.error, type: p.status === 429 ? "insufficient_quota" : "server_error", ...(p.code ? { code: p.code } : {}) } }
           return
         }
         if (p.finish) finish = p.finish
@@ -936,6 +923,7 @@ async function collect(first, rest) {
   let text = ""
   let reasoning = ""
   let error = ""
+  let errorStatus, errorCode, errorSignIn
   let finish = ""
   let usage = null
   let done = false
@@ -945,7 +933,7 @@ async function collect(first, rest) {
     const p = piece(ev, seenCalls)
     if (p.done) done = true
     if (p.usage) usage = p.usage
-    if (p.error) error = p.error
+    if (p.error) { error = p.error; errorStatus = p.status; errorCode = p.code; errorSignIn = p.signIn }
     else {
       text += p.text || ""
       reasoning += p.reasoning || ""
@@ -973,7 +961,7 @@ async function collect(first, rest) {
     if (!c.id) c.id = `call_${c.index}`
     if (!c.function.arguments && (done || finish) && !error) c.function.arguments = "{}"
   }
-  return { text, reasoning, error, finish, usage, calls }
+  return { text, reasoning, error, errorStatus, errorCode, errorSignIn, finish, usage, calls }
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,53 +1045,15 @@ function startCallbackServer(signal, loginBase) {
   })
 }
 
-// 兑换授权码。code→token 的字段名在静态分析里无法唯一确定（服务端只回笼统错误），
-// 按可能性顺序尝试；一旦成功把命中的形状记在返回值里，便于诊断。
-async function exchangeGrant(base, params, options = {}) {
-  const tried = []
-  const attempt = async (body) => {
-    tried.push(body)
-    return apiPost(sameOriginPath(base, "/cloudide/api/v3/trae/oauth/ExchangeToken"), { ...options, body })
+// 授权回调的 userJwt 包含完整凭据，不另做授权码兑换。
+function grantOf(params) {
+  let out
+  try { out = JSON.parse(params.userJwt) } catch { throw new ProtocolError("登录回调缺少有效的 userJwt", { status: 502 }) }
+  const expires = Number(out?.TokenExpireAt)
+  if (typeof out?.Token !== "string" || !out.Token || typeof out.RefreshToken !== "string" || !out.RefreshToken || !Number.isFinite(expires) || expires <= 0) {
+    throw new ProtocolError("登录回调凭据不完整", { status: 502 })
   }
-  const code = String(params.code || params.Code || "")
-  const directRefresh = String(params.refresh_token || params.RefreshToken || "")
-  if (directRefresh) {
-    const tokens = await exchangeRefreshToken(base, directRefresh, options)
-    return { ...tokens, via: "callback.refresh_token" }
-  }
-  if (!code) throw new ProtocolError(`SSO 回调未携带授权码（参数：${Object.keys(params).join(",") || "无"}）`, { status: 502 })
-  const candidates = [
-    { Code: code, ClientID: OAUTH_CLIENT_ID },
-    { Code: code, ClientID: EXCHANGE_CLIENT_ID },
-    { AuthorizationCode: code, ClientID: OAUTH_CLIENT_ID },
-    { Code: code, ClientID: OAUTH_CLIENT_ID, Name: "Codeverse", UserID: "" },
-  ]
-  let last = null
-  for (const body of candidates) {
-    try {
-      const data = await attempt(body)
-      const out = data?.Data || {}
-      if (out.Token && out.RefreshToken) {
-        const expires = Number(out.TokenExpireAt)
-        return {
-          access: String(out.Token),
-          refresh: String(out.RefreshToken),
-          expires: Number.isFinite(expires) && expires > 0 ? expires : Date.now() + (Number(out.TokenExpireDuration) || 1209600000),
-          via: Object.keys(body).join("+"),
-        }
-      }
-      // 返回了 refresh 而没有 access：再换一次。
-      if (out.RefreshToken && !out.Token) {
-        const tokens = await exchangeRefreshToken(base, String(out.RefreshToken), options)
-        return { ...tokens, via: `${Object.keys(body).join("+")}→refresh` }
-      }
-      last = new ProtocolError("ExchangeToken 响应缺少 Token", { status: 502, code: data?.code })
-    } catch (e) {
-      last = e
-    }
-  }
-  if (last) throw Object.assign(last, { tried: tried.map((t) => Object.keys(t).join("+")) })
-  throw new ProtocolError("授权码兑换失败", { status: 502 })
+  return { access: out.Token, refresh: out.RefreshToken, expires, refreshExpires: Number(out.RefreshExpireAt) || 0, via: "sso" }
 }
 
 function identityOf(base, tokens, extra = {}) {
@@ -1112,6 +1062,7 @@ function identityOf(base, tokens, extra = {}) {
     access: tokens.access,
     refresh: tokens.refresh,
     expires: tokens.expires,
+    refreshExpires: tokens.refreshExpires || 0,
     protocol: 2,
     clientID: EXCHANGE_CLIENT_ID,
     baseURL: checkedBase(base),
@@ -1174,7 +1125,7 @@ async function authorizeSso(inputs) {
       inputs?.signal?.throwIfAborted()
       const params = await server.wait()
       cleanup()
-      const tokens = await exchangeGrant(base, params, { signal: inputs?.signal })
+      const tokens = grantOf(params)
       return await identityFromUserInfo(base, tokens, { signal: inputs?.signal })
     } catch (e) {
       cleanup()
@@ -1186,12 +1137,11 @@ async function authorizeSso(inputs) {
     method: "auto",
     callback,
     cancel: cleanup,
-    instructions: "在浏览器完成企业登录。本机可自动回调；远程服务器请把浏览器最终的完整 http://127.0.0.1 回调地址粘贴回 Magpie，勿公开该地址。",
+    instructions: "完成浏览器登录；远程运行时，将最终的完整回调地址粘贴回 Magpie。",
   }
 }
 
-// 从本机 traecli 的 auth.json 导入一次性凭据（导入后由插件独立续期）。
-// 注意：续期会轮换 refresh token，traecli 里那份可能因此失效，属预期迁移行为。
+// CLI 导入后独立续期，原 CLI 的 refresh token 可能因此失效。
 function traeHome(explicit) {
   const dir = String(explicit || "").trim()
   const path = resolve(dir || process.env.TRAE_HOME || join(homedir(), ".trae"))
@@ -1199,8 +1149,7 @@ function traeHome(explicit) {
 }
 
 async function importFromCli(inputs) {
-  // magpie 的 oauth 约定：authorize 返回 {url, instructions, method, callback}，
-  // 一切结果（含失败）都从 callback() 里产出（与浏览器 SSO 路径同形）。
+  // 登录结果统一从 callback 返回。
   const run = async () => {
     const parsed = parseBaseURL(inputs?.baseURL)
     if (parsed.error) return { type: "failed", error: parsed.error }
@@ -1428,7 +1377,7 @@ export default async function TraePrivateAuthPlugin(input) {
                 const n = await it.next()
                 if (n.done) return errorResponse(502, "私有化 TRAE 没有返回内容")
                 const p = piece(n.value, seenCalls)
-                if (p.error) return errorResponse(502, p.error)
+                if (p.error) return errorResponse(p.status || 502, p.error, p.signIn, p.code)
                 if (p.text || p.reasoning || p.calls?.length || p.usage || p.finish || p.done) {
                   first = n.value
                   break
@@ -1436,7 +1385,7 @@ export default async function TraePrivateAuthPlugin(input) {
               }
               if (req.stream !== true) {
                 const all = await collect(first, it)
-                if (all.error) return errorResponse(502, all.error)
+                if (all.error) return errorResponse(all.errorStatus || 502, all.error, all.errorSignIn, all.errorCode)
                 const message = { role: "assistant", content: all.text || (all.calls.length ? "" : all.reasoning) }
                 if (all.reasoning) message.reasoning_content = all.reasoning
                 if (all.calls.length) message.tool_calls = all.calls.map(({ index, ...c }) => c)
@@ -1508,7 +1457,7 @@ export const _internal = {
   getUserInfo,
   checkLogin,
   exchangeRefreshToken,
-  exchangeGrant,
+  grantOf,
   fetchConfigList,
   catalogOf,
   catalogFor,

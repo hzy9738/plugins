@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-trae-private-auth",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Magpie provider plugin for the TraeCode CN Enterprise protocol: browser SSO, rotating token refresh, JWT usage and live models. No traecli process; optional sidecar session for detailed usage.",
   "type": "module",
   "main": "./index.mjs",
@@ -12,7 +12,8 @@
     "README.md",
     "MACHINE-SETUP.md",
     "LICENSE",
-    "THIRD-PARTY-NOTICES.md"
+    "THIRD-PARTY-NOTICES.md",
+    "docs/real-deployment.md"
   ],
   "keywords": [
     "opencode",

@@ -442,30 +442,15 @@ test("apiPost 把 30011 映射为账号失效", async () => {
     await assert.rejects(() => _.apiPost("https://a.com/cloudide/api/v3/trae/GetUserInfo", { body: {} }), (e) => e.signIn === "expired")
   } finally { globalThis.fetch = real }
 })
-test("exchangeGrant 依序尝试候选形状并接受回调直接携带 refresh_token", async () => {
-  const real = globalThis.fetch
-  const calls = []
-  globalThis.fetch = async (url, init) => {
-    const body = JSON.parse(init.body)
-    calls.push(body)
-    if (body.Code === "GOOD" && body.ClientID === _.OAUTH_CLIENT_ID) {
-      return jsonResponse({ code: 0, Data: { Token: "T", RefreshToken: "R", TokenExpireAt: 1, TokenExpireDuration: 1209600000 } })
-    }
-    if (body.RefreshToken === "RT") {
-      return jsonResponse({ code: 0, Data: { Token: "T2", RefreshToken: "R2", TokenExpireAt: 2, TokenExpireDuration: 1209600000 } })
-    }
-    return jsonResponse({ code: 30021, message: "网络异常" })
+test("grantOf 读取真实回调的 userJwt 凭据布局", () => {
+  const expires = Date.now() + 3600000
+  const result = _.grantOf({ userJwt: JSON.stringify({ Token: "access", RefreshToken: "refresh", TokenExpireAt: expires, RefreshExpireAt: expires + 3600000, TokenExpireDuration: 3600000 }) })
+  assert.deepEqual(result, { access: "access", refresh: "refresh", expires, refreshExpires: expires + 3600000, via: "sso" })
+})
+test("grantOf 拒绝损坏或不完整的回调，不把凭据带入错误", () => {
+  for (const userJwt of [undefined, "{", "null", "[]", JSON.stringify({ Token: "secret-value", RefreshToken: "r" }), JSON.stringify({ Token: "t", RefreshToken: "", TokenExpireAt: 1 })]) {
+    assert.throws(() => _.grantOf({ userJwt }), (e) => e.status === 502 && !e.message.includes("secret-value"))
   }
-  try {
-    const viaCode = await _.exchangeGrant("https://a.com", { code: "GOOD" })
-    assert.equal(viaCode.access, "T")
-    assert.equal(viaCode.via, "Code+ClientID")
-    calls.length = 0
-    const viaRefresh = await _.exchangeGrant("https://a.com", { refresh_token: "RT" })
-    assert.equal(viaRefresh.access, "T2")
-    assert.equal(viaRefresh.via, "callback.refresh_token")
-    await assert.rejects(() => _.exchangeGrant("https://a.com", {}))
-  } finally { globalThis.fetch = real }
 })
 test("authAccount 识别旧版 traecli 绑定账号并要求重新登录", () => {
   assert.throws(() => _.authAccount({ traeHome: "/Users/x/.trae", access: "a", baseURL: "https://a.com" }), (e) => e.signIn === "expired")
@@ -581,7 +566,7 @@ test("SSO 超时明确失败，callback 不永久挂起", async () => {
   } finally { grant?.cancel?.(); globalThis.fetch = real; _.loginTimeout = timeout }
 })
 
-test("SSO 回调贯通兑换与身份查询，产出宿主可保存的账号", async () => {
+test("SSO 回调凭据经身份核验后产出宿主可保存的账号", async () => {
   const real = globalThis.fetch
   const localFetch = real
   const calls = []
@@ -590,7 +575,6 @@ test("SSO 回调贯通兑换与身份查询，产出宿主可保存的账号", a
     if (address.startsWith("http://127.0.0.1:")) return localFetch(url, init)
     calls.push(address)
     if (address.endsWith("GetLoginGuidance")) return jsonResponse({ Result: { LoginHost: "login.invalid" } })
-    if (address.endsWith("ExchangeToken")) return jsonResponse({ Data: { Token: "new-access", RefreshToken: "new-refresh", TokenExpireAt: Date.now() + 3600000 } })
     if (address.endsWith("GetUserInfo")) return jsonResponse(USER_INFO_FIXTURE)
     throw new Error("unexpected endpoint")
   }
@@ -599,7 +583,8 @@ test("SSO 回调贯通兑换与身份查询，产出宿主可保存的账号", a
     grant = await _.authorizeSso({ baseURL: "https://deployment.invalid" })
     const callbackURL = new URL(grant.url).searchParams.get("auth_callback_url")
     const waiting = grant.callback()
-    const response = await fetch(`${callbackURL}?code=authorization-code`)
+    const userJwt = JSON.stringify({ Token: "new-access", RefreshToken: "new-refresh", TokenExpireAt: Date.now() + 3600000 })
+    const response = await fetch(`${callbackURL}?${new URLSearchParams({ userJwt })}`)
     assert.equal(response.status, 200)
     await response.text()
     const account = await waiting
@@ -608,7 +593,7 @@ test("SSO 回调贯通兑换与身份查询，产出宿主可保存的账号", a
     assert.equal(account.refresh, "new-refresh")
     assert.equal(account.baseURL, "https://deployment.invalid")
     assert.equal(account.uid, "1")
-    assert.equal(calls.length, 3)
+    assert.equal(calls.length, 2)
   } finally { grant?.cancel?.(); globalThis.fetch = real }
 })
 
@@ -730,6 +715,37 @@ test("隔离层拒绝沙盒外文件、外网和子进程", async () => {
   assert.throws(() => fs.writeFileSync(join(root, "must-not-exist"), "bad"), /Test isolation/)
   assert.throws(() => cp.spawn("must-not-run", []), /Test isolation/)
   await assert.rejects(() => fetch("https://network.invalid"), /Test isolation/)
+})
+
+const QUOTA_ERROR = { code: 4222, error: "biz error: rpc error: code = ErrAllModelUserQuotaExceeded desc = , origin err = entitlement check failed", message: "", extra: null }
+test("真实额度拒绝帧在流式和非流式请求中返回 429 并保留登录", async () => {
+  const real = globalThis.fetch
+  globalThis.fetch = async (url) => String(url).endsWith("get_config_list")
+    ? jsonResponse(CONFIG_LIST_FIXTURE)
+    : new Response(`event: error\ndata: ${JSON.stringify(QUOTA_ERROR)}\n\n`, { headers: { "content-type": "text/event-stream" } })
+  try {
+    const plugin = await mod.default({})
+    const loader = await plugin.auth.loader(async () => ({ baseURL: "https://quota.invalid", access: "a", refresh: "r", expires: Date.now() + 3600000 }))
+    for (const stream of [undefined, false, true]) {
+      const response = await loader.fetch("https://unconnected.invalid/v1/chat/completions", { body: JSON.stringify({ model: "glm-5.3", messages: [{ role: "user", content: "hi" }], stream }) })
+      assert.equal(response.status, 429)
+      assert.equal(response.headers.get("X-Magpie-Sign-In"), "kept")
+      assert.deepEqual((await response.json()).error, { message: "TRAE 模型额度已用尽", type: "insufficient_quota", code: "ErrAllModelUserQuotaExceeded" })
+    }
+  } finally { globalThis.fetch = real }
+})
+test("响应中途出现额度错误时不伪造成功结束", async () => {
+  const first = { event: "output", data: { response: "partial" } }
+  async function* remaining() { yield { event: "error", data: QUOTA_ERROR } }
+  const all = await _.collect(first, remaining())
+  assert.equal(all.errorStatus, 429)
+  assert.equal(all.errorCode, "ErrAllModelUserQuotaExceeded")
+  assert.equal(all.errorSignIn, "kept")
+  const response = _.streamResponse("model", first, remaining())
+  const text = await response.text()
+  assert.ok(text.includes('"type":"insufficient_quota"'))
+  assert.ok(text.includes('"code":"ErrAllModelUserQuotaExceeded"'))
+  assert.ok(!text.includes('"finish_reason":"stop"'))
 })
 
 // ---------------------------------------------------------------------------
